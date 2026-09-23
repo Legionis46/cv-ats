@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import path from 'path';
 import fs from 'fs';
-import { getCandidateById } from '@/lib/db';
+import { getCandidateById, getStorageBaseDir } from '@/lib/db';
 
 export async function GET(
   _request: NextRequest,
@@ -20,8 +20,11 @@ export async function GET(
       return NextResponse.redirect(candidate.file_path);
     }
 
-    // Local file storage
-    const filePath = path.join(process.cwd(), 'uploads', candidate.file_path);
+    // Local file storage — check both storage base dir and cwd
+    let filePath = path.join(getStorageBaseDir(), 'uploads', candidate.file_path);
+    if (!fs.existsSync(filePath)) {
+      filePath = path.join(process.cwd(), 'uploads', candidate.file_path);
+    }
     if (!fs.existsSync(filePath)) {
       return NextResponse.json({ error: 'Dosya sistemde yok.' }, { status: 404 });
     }

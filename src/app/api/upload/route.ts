@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createCandidate } from '@/lib/db';
+import { createCandidate, getStorageBaseDir } from '@/lib/db';
 import { extractTextFromBuffer, validateFileType } from '@/lib/parser';
 import { parseCV } from '@/lib/llm';
 
@@ -59,7 +59,6 @@ export async function POST(request: NextRequest) {
       const msg = e instanceof Error ? e.message : 'Bilinmeyen hata';
       console.warn(`Text extraction warning (continuing anyway): ${msg}`);
       extractionFailed = true;
-      // We still continue — we'll save the candidate with minimal info
     }
 
     // Parse CV with AI or regex (even with partial text)
@@ -102,7 +101,7 @@ export async function POST(request: NextRequest) {
       try {
         const { writeFile, mkdir } = await import('fs/promises');
         const pathMod = await import('path');
-        const uploadsDir = pathMod.join(process.cwd(), 'uploads');
+        const uploadsDir = pathMod.join(getStorageBaseDir(), 'uploads');
         await mkdir(uploadsDir, { recursive: true });
         await writeFile(pathMod.join(uploadsDir, uniqueFileName), buffer);
       } catch (fsErr) {
@@ -147,7 +146,7 @@ export async function POST(request: NextRequest) {
     const msg = error instanceof Error ? error.message : String(error);
     console.error(`Upload error at [${step}]:`, msg);
     return NextResponse.json(
-      { error: `Yükleme hatası: ${msg}` },
+      { error: `Yükleme hatası (${step}): ${msg}` },
       { status: 500 }
     );
   }

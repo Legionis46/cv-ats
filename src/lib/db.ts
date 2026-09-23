@@ -1,11 +1,12 @@
 /**
  * Hybrid Database Module
  * - If TURSO_DATABASE_URL is set -> uses Turso (cloud LibSQL/SQLite)
- * - If not set -> falls back to local JSON database (data/candidates.json & data/notes.json)
- * Works seamlessly both offline/locally and when deployed to Vercel/cloud!
+ * - If not set -> falls back to local JSON database.
+ * - On Vercel / serverless: uses os.tmpdir() + in-memory store so it NEVER crashes with EROFS (Read-only filesystem)!
  */
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { Candidate, Note } from '@/types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,35 +87,99 @@ function rowToNote(row: Record<string, any>): Note {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LOCAL JSON MODE (Zero-configuration local storage)
+// SAFE LOCAL / SERVERLESS JSON STORE
 // ─────────────────────────────────────────────────────────────────────────────
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-const CANDIDATES_FILE = path.join(DATA_DIR, 'candidates.json');
-const NOTES_FILE = path.join(DATA_DIR, 'notes.json');
-
-function ensureLocalFiles() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(CANDIDATES_FILE)) fs.writeFileSync(CANDIDATES_FILE, '[]', 'utf-8');
-  if (!fs.existsSync(NOTES_FILE)) fs.writeFileSync(NOTES_FILE, '[]', 'utf-8');
-
-  const uploadsDir = path.join(process.cwd(), 'uploads');
-  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+// Global memory cache so candidates stay available across requests in serverless functions
+// eslint-disable-next-line no-var
+declare global {
+  // eslint-disable-next-line no-var
+  var __memoryCandidates: Candidate[] | undefined;
+  // eslint-disable-next-line no-var
+  var __memoryNotes: Note[] | undefined;
 }
 
-function readJSON<T>(filePath: string): T[] {
-  ensureLocalFiles();
+if (!global.__memoryCandidates) {
+  global.__memoryCandidates = [];
+}
+if (!global.__memoryNotes) {
+  global.__memoryNotes = [];
+}
+
+export function getStorageBaseDir(): string {
+  // Vercel serverless has a read-only root directory; /tmp is the only writable area
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return os.tmpdir();
+  }
+  return process.cwd();
+}
+
+function getDataDir(): string {
+  return path.join(getStorageBaseDir(), 'data');
+}
+
+function ensureLocalFiles() {
   try {
-    const raw = fs.readFileSync(filePath, 'utf-8');
-    return JSON.parse(raw) as T[];
-  } catch {
-    return [];
+    const dataDir = getDataDir();
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    const candFile = path.join(dataDir, 'candidates.json');
+    if (!fs.existsSync(candFile)) {
+      fs.writeFileSync(candFile, '[]', 'utf-8');
+    }
+    const notesFile = path.join(dataDir, 'notes.json');
+    if (!fs.existsSync(notesFile)) {
+      fs.writeFileSync(notesFile, '[]', 'utf-8');
+    }
+
+    const uploadsDir = path.join(getStorageBaseDir(), 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+  } catch (err) {
+    console.warn('Disk storage warning, falling back to memory:', err);
   }
 }
 
-function writeJSON<T>(filePath: string, data: T[]): void {
+function readJSON<T>(filename: 'candidates.json' | 'notes.json'): T[] {
   ensureLocalFiles();
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  const filePath = path.join(getDataDir(), filename);
+  try {
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const parsed = JSON.parse(raw) as T[];
+      if (filename === 'candidates.json') {
+        global.__memoryCandidates = parsed as unknown as Candidate[];
+      } else {
+        global.__memoryNotes = parsed as unknown as Note[];
+      }
+      return parsed;
+    }
+  } catch (err) {
+    console.warn(`readJSON ${filename} failed, using memory:`, err);
+  }
+
+  // Fallback to in-memory store
+  return (filename === 'candidates.json'
+    ? global.__memoryCandidates
+    : global.__memoryNotes) as unknown as T[];
+}
+
+function writeJSON<T>(filename: 'candidates.json' | 'notes.json', data: T[]): void {
+  ensureLocalFiles();
+  if (filename === 'candidates.json') {
+    global.__memoryCandidates = data as unknown as Candidate[];
+  } else {
+    global.__memoryNotes = data as unknown as Note[];
+  }
+
+  try {
+    const filePath = path.join(getDataDir(), filename);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn(`writeJSON ${filename} disk write failed, preserved in memory:`, err);
+  }
 }
 
 function nextId(items: Array<{ id: number }>): number {
@@ -136,7 +201,7 @@ export async function getAllCandidates(): Promise<Candidate[]> {
     const result = await db.execute('SELECT * FROM candidates ORDER BY created_at DESC');
     return result.rows.map((r: Record<string, unknown>) => rowToCandidate(r));
   } else {
-    return readJSON<Candidate>(CANDIDATES_FILE);
+    return readJSON<Candidate>('candidates.json');
   }
 }
 
@@ -148,7 +213,7 @@ export async function getCandidateById(id: number): Promise<Candidate | null> {
     if (result.rows.length === 0) return null;
     return rowToCandidate(result.rows[0] as Record<string, unknown>);
   } else {
-    const list = readJSON<Candidate>(CANDIDATES_FILE);
+    const list = readJSON<Candidate>('candidates.json');
     return list.find((c) => c.id === id) || null;
   }
 }
@@ -186,14 +251,14 @@ export async function createCandidate(
     const candidate = await getCandidateById(Number(result.lastInsertRowid));
     return candidate!;
   } else {
-    const candidates = readJSON<Candidate>(CANDIDATES_FILE);
+    const candidates = readJSON<Candidate>('candidates.json');
     const candidate: Candidate = {
       ...data,
       id: nextId(candidates),
       created_at: now(),
       updated_at: now(),
     };
-    writeJSON(CANDIDATES_FILE, [...candidates, candidate]);
+    writeJSON('candidates.json', [...candidates, candidate]);
     return candidate;
   }
 }
@@ -211,11 +276,11 @@ export async function updateCandidateStatus(
     });
     return getCandidateById(id);
   } else {
-    const candidates = readJSON<Candidate>(CANDIDATES_FILE);
+    const candidates = readJSON<Candidate>('candidates.json');
     const idx = candidates.findIndex((c) => c.id === id);
     if (idx === -1) return null;
     candidates[idx] = { ...candidates[idx], status, updated_at: now() };
-    writeJSON(CANDIDATES_FILE, candidates);
+    writeJSON('candidates.json', candidates);
     return candidates[idx];
   }
 }
@@ -227,13 +292,13 @@ export async function deleteCandidate(id: number): Promise<boolean> {
     const result = await db.execute({ sql: 'DELETE FROM candidates WHERE id = ?', args: [id] });
     return (result.rowsAffected ?? 0) > 0;
   } else {
-    const candidates = readJSON<Candidate>(CANDIDATES_FILE);
+    const candidates = readJSON<Candidate>('candidates.json');
     const filtered = candidates.filter((c) => c.id !== id);
     if (filtered.length === candidates.length) return false;
-    writeJSON(CANDIDATES_FILE, filtered);
+    writeJSON('candidates.json', filtered);
 
-    const notes = readJSON<Note>(NOTES_FILE).filter((n) => n.candidate_id !== id);
-    writeJSON(NOTES_FILE, notes);
+    const notes = readJSON<Note>('notes.json').filter((n) => n.candidate_id !== id);
+    writeJSON('notes.json', notes);
     return true;
   }
 }
@@ -289,7 +354,7 @@ export async function queryCandidates(params: {
     const result = await db.execute({ sql, args });
     return result.rows.map((r: Record<string, unknown>) => rowToCandidate(r));
   } else {
-    let list = readJSON<Candidate>(CANDIDATES_FILE);
+    let list = readJSON<Candidate>('candidates.json');
 
     if (params.search) {
       const s = params.search.toLowerCase();
@@ -346,7 +411,7 @@ export async function getNotesByCandidate(candidateId: number): Promise<Note[]> 
     });
     return result.rows.map((r: Record<string, unknown>) => rowToNote(r));
   } else {
-    return readJSON<Note>(NOTES_FILE)
+    return readJSON<Note>('notes.json')
       .filter((n) => n.candidate_id === candidateId)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   }
@@ -366,7 +431,7 @@ export async function createNote(candidateId: number, content: string): Promise<
     });
     return rowToNote(res2.rows[0] as Record<string, unknown>);
   } else {
-    const notes = readJSON<Note>(NOTES_FILE);
+    const notes = readJSON<Note>('notes.json');
     const note: Note = {
       id: nextId(notes),
       candidate_id: candidateId,
@@ -374,7 +439,7 @@ export async function createNote(candidateId: number, content: string): Promise<
       created_at: now(),
       updated_at: now(),
     };
-    writeJSON(NOTES_FILE, [...notes, note]);
+    writeJSON('notes.json', [...notes, note]);
     return note;
   }
 }
@@ -391,11 +456,11 @@ export async function updateNote(id: number, content: string): Promise<Note | nu
     if (result.rows.length === 0) return null;
     return rowToNote(result.rows[0] as Record<string, unknown>);
   } else {
-    const notes = readJSON<Note>(NOTES_FILE);
+    const notes = readJSON<Note>('notes.json');
     const idx = notes.findIndex((n) => n.id === id);
     if (idx === -1) return null;
     notes[idx] = { ...notes[idx], content, updated_at: now() };
-    writeJSON(NOTES_FILE, notes);
+    writeJSON('notes.json', notes);
     return notes[idx];
   }
 }
@@ -407,10 +472,10 @@ export async function deleteNote(id: number): Promise<boolean> {
     const result = await db.execute({ sql: 'DELETE FROM notes WHERE id = ?', args: [id] });
     return (result.rowsAffected ?? 0) > 0;
   } else {
-    const notes = readJSON<Note>(NOTES_FILE);
+    const notes = readJSON<Note>('notes.json');
     const filtered = notes.filter((n) => n.id !== id);
     if (filtered.length === notes.length) return false;
-    writeJSON(NOTES_FILE, filtered);
+    writeJSON('notes.json', filtered);
     return true;
   }
 }

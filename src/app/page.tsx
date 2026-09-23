@@ -82,7 +82,6 @@ export default function DashboardPage() {
       const serverList: Candidate[] = data.candidates || [];
 
       setCandidates((prev) => {
-        // Merge server list with local candidates to prevent data loss on serverless cold starts
         const map = new Map<number, Candidate>();
         prev.forEach((c) => map.set(c.id, c));
         serverList.forEach((c) => map.set(c.id, c));
@@ -98,7 +97,6 @@ export default function DashboardPage() {
         return merged;
       });
     } catch {
-      // Only show error if no cached data exists
       if (candidates.length === 0) {
         toast.error('Adaylar yüklenemedi.');
       }
@@ -124,7 +122,6 @@ export default function DashboardPage() {
         return updated;
       });
     }
-    // Also re-fetch in background
     fetchCandidates();
     setTimeout(() => setShowUpload(false), 2000);
   };
@@ -144,6 +141,43 @@ export default function DashboardPage() {
     }
     fetchCandidates();
   };
+
+  // Filter candidates locally if filter is active
+  const filteredCandidates = candidates.filter((c) => {
+    if (debouncedFilters.search) {
+      const q = debouncedFilters.search.toLowerCase();
+      const match =
+        c.name.toLowerCase().includes(q) ||
+        (c.last_position || '').toLowerCase().includes(q) ||
+        (c.last_company || '').toLowerCase().includes(q) ||
+        (c.summary || '').toLowerCase().includes(q);
+      if (!match) return false;
+    }
+    if (debouncedFilters.status && c.status !== debouncedFilters.status) {
+      return false;
+    }
+    if (debouncedFilters.university) {
+      const u = debouncedFilters.university.toLowerCase();
+      if (!(c.university || '').toLowerCase().includes(u)) return false;
+    }
+    if (debouncedFilters.department) {
+      const d = debouncedFilters.department.toLowerCase();
+      if (!(c.department || '').toLowerCase().includes(d)) return false;
+    }
+    if (debouncedFilters.min_experience !== undefined) {
+      if ((c.experience_years || 0) < debouncedFilters.min_experience) return false;
+    }
+    if (debouncedFilters.max_experience !== undefined) {
+      if ((c.experience_years || 0) > debouncedFilters.max_experience) return false;
+    }
+    if (debouncedFilters.skills && debouncedFilters.skills.length > 0) {
+      const hasAllSkills = debouncedFilters.skills.every((skill) =>
+        c.skills.some((s) => s.toLowerCase().includes(skill.toLowerCase()))
+      );
+      if (!hasAllSkills) return false;
+    }
+    return true;
+  });
 
   const stats = {
     total: candidates.length,
@@ -289,7 +323,7 @@ export default function DashboardPage() {
             <p className="text-sm text-slate-500">
               {loading && candidates.length === 0
                 ? 'Yükleniyor...'
-                : `${candidates.length} aday bulundu`}
+                : `${filteredCandidates.length} aday bulundu`}
             </p>
           </div>
 
@@ -318,7 +352,7 @@ export default function DashboardPage() {
                 </div>
               ))}
             </div>
-          ) : candidates.length === 0 ? (
+          ) : filteredCandidates.length === 0 ? (
             <div className="card text-center py-20">
               <div className="w-16 h-16 bg-slate-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
                 <Search className="w-8 h-8 text-slate-300" />
@@ -343,7 +377,7 @@ export default function DashboardPage() {
                   : 'grid-cols-1'
               }`}
             >
-              {candidates.map((c) => (
+              {filteredCandidates.map((c) => (
                 <CandidateCard
                   key={c.id}
                   candidate={c}
@@ -359,8 +393,24 @@ export default function DashboardPage() {
       {selectedId !== null && (
         <CandidateModal
           candidateId={selectedId}
+          initialCandidate={candidates.find((c) => c.id === selectedId) || null}
           onClose={() => setSelectedId(null)}
-          onUpdate={fetchCandidates}
+          onUpdate={(updatedCandidate) => {
+            if (updatedCandidate) {
+              setCandidates((prev) => {
+                const list = prev.map((c) =>
+                  c.id === updatedCandidate.id ? updatedCandidate : c
+                );
+                try {
+                  localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+                } catch {
+                  // ignore
+                }
+                return list;
+              });
+            }
+            fetchCandidates();
+          }}
           onDelete={handleCandidateDelete}
         />
       )}

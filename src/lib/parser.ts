@@ -1,37 +1,44 @@
-import fs from 'fs';
+/**
+ * File text extraction — works with Buffer directly (no file path needed).
+ * This approach works both locally and on Vercel serverless.
+ */
 
-export async function extractTextFromFile(filePath: string, mimeType: string): Promise<string> {
-  const buffer = fs.readFileSync(filePath);
+export async function extractTextFromBuffer(buffer: Buffer, fileName: string, mimeType: string): Promise<string> {
+  const lowerName = fileName.toLowerCase();
 
-  if (mimeType === 'application/pdf' || filePath.toLowerCase().endsWith('.pdf')) {
+  if (mimeType === 'application/pdf' || lowerName.endsWith('.pdf')) {
     return extractFromPDF(buffer);
   } else if (
     mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
     mimeType === 'application/msword' ||
-    filePath.toLowerCase().endsWith('.docx') ||
-    filePath.toLowerCase().endsWith('.doc')
+    lowerName.endsWith('.docx') ||
+    lowerName.endsWith('.doc')
   ) {
     return extractFromDOCX(buffer);
   } else if (mimeType === 'text/plain') {
     return buffer.toString('utf-8');
   }
-  throw new Error(`Desteklenmeyen dosya formatı: ${mimeType}`);
+  throw new Error(`Desteklenmeyen dosya formatı. Sadece PDF veya DOCX yükleyin.`);
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
   try {
-    const pdfParseModule = await import('pdf-parse');
-    // pdf-parse exports a function or default function depending on environment
-    // eslint-disable-next-line
-    const pdfParse = typeof pdfParseModule === 'function' ? pdfParseModule : (pdfParseModule as any).default || pdfParseModule;
+    // pdf-parse must be required (not imported) to avoid Next.js edge runtime issues
+    // We use a workaround to make it work in serverless environments
+    const pdfParse = require('pdf-parse'); // eslint-disable-line
     const data = await pdfParse(buffer);
     if (!data.text || data.text.trim().length === 0) {
-      throw new Error('PDF içeriği okunamadı. Lütfen metin tabanlı bir PDF yükleyin.');
+      throw new Error('PDF içeriği boş veya okunamıyor. Lütfen metin tabanlı bir PDF yükleyin.');
     }
     return data.text;
   } catch (error: unknown) {
-    if (error instanceof Error && error.message.includes('PDF içeriği')) throw error;
-    throw new Error('PDF dosyası işlenirken bir hata oluştu.');
+    if (error instanceof Error && (
+      error.message.includes('PDF içeriği') ||
+      error.message.includes('okunamıyor')
+    )) {
+      throw error;
+    }
+    throw new Error('PDF dosyası işlenirken hata oluştu. Dosyanın bozuk olmadığından emin olun.');
   }
 }
 
@@ -40,12 +47,12 @@ async function extractFromDOCX(buffer: Buffer): Promise<string> {
     const mammoth = await import('mammoth');
     const result = await mammoth.extractRawText({ buffer });
     if (!result.value || result.value.trim().length === 0) {
-      throw new Error('DOCX dosyası boş veya içeriği okunamadı.');
+      throw new Error('DOCX dosyası boş veya içeriği okunamıyor.');
     }
     return result.value;
   } catch (error: unknown) {
     if (error instanceof Error && error.message.includes('DOCX')) throw error;
-    throw new Error('DOCX dosyası işlenirken bir hata oluştu.');
+    throw new Error('DOCX dosyası işlenirken hata oluştu.');
   }
 }
 

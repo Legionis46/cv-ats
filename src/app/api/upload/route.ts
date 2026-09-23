@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { writeFile } from 'fs/promises';
-import path from 'path';
 import { createCandidate } from '@/lib/db';
-import { extractTextFromFile, validateFileType } from '@/lib/parser';
+import { extractTextFromBuffer, validateFileType } from '@/lib/parser';
 import { parseCV } from '@/lib/llm';
 
 function generateId(): string {
@@ -15,63 +13,34 @@ export async function POST(request: NextRequest) {
     const file = formData.get('file') as File | null;
 
     if (!file) {
-      return NextResponse.json({ error: 'Dosya bulunamadı. Lütfen bir CV dosyası yükleyin.' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Dosya bulunamadı. Lütfen bir CV dosyası yükleyin.' },
+        { status: 400 }
+      );
     }
+
     if (!validateFileType(file.type, file.name)) {
       return NextResponse.json(
         { error: 'Geçersiz dosya formatı. Sadece PDF veya DOCX kabul edilir.' },
         { status: 400 }
       );
     }
+
     if (file.size > 10 * 1024 * 1024) {
-      return NextResponse.json({ error: 'Dosya çok büyük. Maksimum 10MB.' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Dosya çok büyük. Maksimum 10MB.' },
+        { status: 400 }
+      );
     }
 
+    // Read file into Buffer (works everywhere - local and Vercel)
     const fileBytes = await file.arrayBuffer();
     const buffer = Buffer.from(fileBytes);
 
-    // Save file: Use Vercel Blob if configured, else save to local uploads/
-    let storedFilePath = '';
-    const ext = file.name.toLowerCase().endsWith('.docx') ? '.docx'
-              : file.name.toLowerCase().endsWith('.doc') ? '.doc' : '.pdf';
-    const uniqueFileName = `${generateId()}${ext}`;
-
-    const uploadsDir = path.join(process.cwd(), 'uploads');
-    const localTempPath = path.join(uploadsDir, uniqueFileName);
-
-    if (process.env.BLOB_READ_WRITE_TOKEN) {
-      try {
-        const { put } = await import('@vercel/blob');
-        const blob = await put(`cvs/${uniqueFileName}`, file, {
-          access: 'public',
-        });
-        storedFilePath = blob.url;
-      } catch (blobErr) {
-        console.warn('Vercel Blob failed, falling back to local file storage:', blobErr);
-        await writeFile(localTempPath, buffer);
-        storedFilePath = uniqueFileName;
-      }
-    } else {
-      await writeFile(localTempPath, buffer);
-      storedFilePath = uniqueFileName;
-    }
-
-    // Always ensure local file exists for text extraction
-    if (!storedFilePath.startsWith('http')) {
-      // already written
-    } else {
-      // In cloud environment, write temporarily to extract text
-      try {
-        await writeFile(localTempPath, buffer);
-      } catch {
-        // if filesystem is read-only (unlikely for /tmp), we handle gracefully
-      }
-    }
-
-    // Extract text
+    // Extract text directly from Buffer (no filesystem needed)
     let text = '';
     try {
-      text = await extractTextFromFile(localTempPath, file.type);
+      text = await extractTextFromBuffer(buffer, file.name, file.type);
     } catch (e) {
       return NextResponse.json(
         { error: e instanceof Error ? e.message : 'Dosya metni okunamadı.' },
@@ -86,10 +55,46 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Parse with LLM (or regex fallback)
+    // Store file: Vercel Blob if configured, else local uploads/
+    const ext = file.name.toLowerCase().endsWith('.docx')
+      ? '.docx'
+      : file.name.toLowerCase().endsWith('.doc')
+      ? '.doc'
+      : '.pdf';
+    const uniqueFileName = `${generateId()}${ext}`;
+    let storedFilePath = uniqueFileName;
+
+    if (process.env.BLOB_READ_WRITE_TOKEN) {
+      // Vercel Blob storage
+      try {
+        const { put } = await import('@vercel/blob');
+        const blob = await put(`cvs/${uniqueFileName}`, buffer, {
+          access: 'public',
+          contentType: file.type || 'application/octet-stream',
+        });
+        storedFilePath = blob.url;
+      } catch (blobErr) {
+        console.warn('Vercel Blob failed, saving filename only:', blobErr);
+        storedFilePath = uniqueFileName;
+      }
+    } else {
+      // Local storage — write to uploads/ directory
+      try {
+        const { writeFile, mkdir } = await import('fs/promises');
+        const path = await import('path');
+        const uploadsDir = path.join(process.cwd(), 'uploads');
+        await mkdir(uploadsDir, { recursive: true });
+        await writeFile(path.join(uploadsDir, uniqueFileName), buffer);
+      } catch (fsErr) {
+        console.warn('Local file write failed:', fsErr);
+        // Continue without local file — text was already extracted
+      }
+    }
+
+    // Parse with AI (or regex fallback)
     const parsed = await parseCV(text);
 
-    // Save to Database
+    // Save candidate to database
     const candidate = await createCandidate({
       name: parsed.name,
       email: parsed.email || null,
@@ -109,9 +114,16 @@ export async function POST(request: NextRequest) {
       file_name: file.name,
     });
 
-    return NextResponse.json({ success: true, message: 'CV başarıyla işlendi.', candidate });
+    return NextResponse.json({
+      success: true,
+      message: 'CV başarıyla yüklendi ve işlendi.',
+      candidate,
+    });
   } catch (error) {
     console.error('Upload error:', error);
-    return NextResponse.json({ error: 'Beklenmeyen bir hata oluştu.' }, { status: 500 });
+    return NextResponse.json(
+      { error: 'Beklenmeyen bir hata oluştu. Lütfen tekrar deneyin.' },
+      { status: 500 }
+    );
   }
 }

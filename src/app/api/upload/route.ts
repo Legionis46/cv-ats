@@ -7,8 +7,12 @@ function generateId(): string {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 }
 
+export const maxDuration = 60;
+
 export async function POST(request: NextRequest) {
+  let step = 'init';
   try {
+    step = 'formData';
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
 
@@ -33,39 +37,57 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Read file into Buffer (works everywhere - local and Vercel)
+    // Read file into Buffer (works everywhere)
+    step = 'readBuffer';
     const fileBytes = await file.arrayBuffer();
     const buffer = Buffer.from(fileBytes);
 
-    // Extract text directly from Buffer (no filesystem needed)
+    if (buffer.length === 0) {
+      return NextResponse.json(
+        { error: 'Dosya boş. Lütfen geçerli bir dosya seçin.' },
+        { status: 400 }
+      );
+    }
+
+    // Extract text — multiple fallback strategies, should not fail for valid files
+    step = 'extractText';
     let text = '';
+    let extractionFailed = false;
     try {
       text = await extractTextFromBuffer(buffer, file.name, file.type);
     } catch (e) {
-      return NextResponse.json(
-        { error: e instanceof Error ? e.message : 'Dosya metni okunamadı.' },
-        { status: 422 }
-      );
+      const msg = e instanceof Error ? e.message : 'Bilinmeyen hata';
+      console.warn(`Text extraction warning (continuing anyway): ${msg}`);
+      extractionFailed = true;
+      // We still continue — we'll save the candidate with minimal info
     }
 
-    if (text.trim().length < 20) {
-      return NextResponse.json(
-        { error: 'CV içeriği çok kısa veya boş. Lütfen geçerli bir CV yükleyin.' },
-        { status: 422 }
-      );
+    // Parse CV with AI or regex (even with partial text)
+    step = 'parseCV';
+    let parsed;
+    if (text && text.trim().length > 10) {
+      try {
+        parsed = await parseCV(text);
+      } catch (e) {
+        console.error('parseCV error:', e);
+        parsed = null;
+      }
     }
 
-    // Store file: Vercel Blob if configured, else local uploads/
-    const ext = file.name.toLowerCase().endsWith('.docx')
-      ? '.docx'
-      : file.name.toLowerCase().endsWith('.doc')
-      ? '.doc'
-      : '.pdf';
+    // If extraction failed or parse gave nothing, use filename as name
+    const fileName = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
+    const candidateName = parsed?.name && parsed.name !== 'İsim Bulunamadı'
+      ? parsed.name
+      : fileName || 'İsimsiz Aday';
+
+    // Store the file
+    step = 'storeFile';
+    const ext = file.name.toLowerCase().endsWith('.docx') ? '.docx'
+      : file.name.toLowerCase().endsWith('.doc') ? '.doc' : '.pdf';
     const uniqueFileName = `${generateId()}${ext}`;
     let storedFilePath = uniqueFileName;
 
     if (process.env.BLOB_READ_WRITE_TOKEN) {
-      // Vercel Blob storage
       try {
         const { put } = await import('@vercel/blob');
         const blob = await put(`cvs/${uniqueFileName}`, buffer, {
@@ -74,55 +96,58 @@ export async function POST(request: NextRequest) {
         });
         storedFilePath = blob.url;
       } catch (blobErr) {
-        console.warn('Vercel Blob failed, saving filename only:', blobErr);
-        storedFilePath = uniqueFileName;
+        console.warn('Vercel Blob failed:', blobErr);
       }
     } else {
-      // Local storage — write to uploads/ directory
       try {
         const { writeFile, mkdir } = await import('fs/promises');
-        const path = await import('path');
-        const uploadsDir = path.join(process.cwd(), 'uploads');
+        const pathMod = await import('path');
+        const uploadsDir = pathMod.join(process.cwd(), 'uploads');
         await mkdir(uploadsDir, { recursive: true });
-        await writeFile(path.join(uploadsDir, uniqueFileName), buffer);
+        await writeFile(pathMod.join(uploadsDir, uniqueFileName), buffer);
       } catch (fsErr) {
-        console.warn('Local file write failed:', fsErr);
-        // Continue without local file — text was already extracted
+        console.warn('Local file save failed (non-critical):', fsErr);
       }
     }
 
-    // Parse with AI (or regex fallback)
-    const parsed = await parseCV(text);
-
-    // Save candidate to database
+    // Save to database
+    step = 'saveDB';
     const candidate = await createCandidate({
-      name: parsed.name,
-      email: parsed.email || null,
-      phone: parsed.phone || null,
-      location: parsed.location || null,
-      university: parsed.university || null,
-      department: parsed.department || null,
-      graduation_year: parsed.graduation_year || null,
-      skills: parsed.skills || [],
-      experience_years: parsed.experience_years || 0,
-      last_position: parsed.last_position || null,
-      last_company: parsed.last_company || null,
-      languages: parsed.languages || [],
-      summary: parsed.summary || null,
+      name: candidateName,
+      email: parsed?.email || null,
+      phone: parsed?.phone || null,
+      location: parsed?.location || null,
+      university: parsed?.university || null,
+      department: parsed?.department || null,
+      graduation_year: parsed?.graduation_year || null,
+      skills: parsed?.skills || [],
+      experience_years: parsed?.experience_years || 0,
+      last_position: parsed?.last_position || null,
+      last_company: parsed?.last_company || null,
+      languages: parsed?.languages || [],
+      summary: extractionFailed
+        ? 'Dosya içeriği otomatik okunamadı. Detayları manuel olarak düzenleyebilirsiniz.'
+        : (parsed?.summary || null),
       status: 'Yeni',
       file_path: storedFilePath,
       file_name: file.name,
     });
 
+    const message = extractionFailed
+      ? 'CV dosyası kaydedildi (içerik okunamadı, manuel düzenleme gerekebilir).'
+      : 'CV başarıyla yüklendi ve işlendi.';
+
     return NextResponse.json({
       success: true,
-      message: 'CV başarıyla yüklendi ve işlendi.',
+      message,
       candidate,
     });
+
   } catch (error) {
-    console.error('Upload error:', error);
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`Upload error at [${step}]:`, msg);
     return NextResponse.json(
-      { error: 'Beklenmeyen bir hata oluştu. Lütfen tekrar deneyin.' },
+      { error: `Yükleme hatası: ${msg}` },
       { status: 500 }
     );
   }
